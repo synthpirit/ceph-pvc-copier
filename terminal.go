@@ -7,8 +7,8 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,12 +21,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/util/homedir"
 )
 
-// ==================== 数据结构定义 ====================
+// ==================== Data Models ====================
 
-// DirectoryRequest 容器目录信息查询请求
 type DirectoryRequest struct {
 	ClusterName   string `json:"cluster_name"`
 	Kubeconfig    string `json:"kubeconfig"`
@@ -37,7 +35,6 @@ type DirectoryRequest struct {
 	Depth         int    `json:"depth" binding:"required,min=0,max=10"`
 }
 
-// DirectoryResponse 响应结构体
 type DirectoryResponse struct {
 	Success bool        `json:"success"`
 	Data    interface{} `json:"data,omitempty"`
@@ -46,20 +43,19 @@ type DirectoryResponse struct {
 	Details ErrorDetail `json:"details,omitempty"`
 }
 
-// PathItem 路径项
 type PathItem struct {
 	Path string `json:"path"`
 	Name string `json:"name"`
 	Type string `json:"type"` // "file" or "directory"
 }
 
-// ErrorDetail 错误详情
 type ErrorDetail struct {
 	Stdout string `json:"stdout,omitempty"`
 	Stderr string `json:"stderr,omitempty"`
 }
 
-// ClusterConfig 集群配置
+// ClusterConfig maps to the `cluster` table in MySQL.
+// The Description field stores the kubeconfig YAML content.
 type ClusterConfig struct {
 	ID          int64   `db:"id"`
 	Name        string  `db:"name"`
@@ -72,7 +68,6 @@ type ClusterConfig struct {
 	DelFlag     int     `db:"del_flag"`
 }
 
-// ClusterResponse 用于 API 响应的集群配置（不包含敏感的 kubeconfig 数据摘要）
 type ClusterResponse struct {
 	ID         int64   `json:"id"`
 	Name       string  `json:"name"`
@@ -83,9 +78,8 @@ type ClusterResponse struct {
 	CreateTime *string `json:"create_time,omitempty"`
 }
 
-// TerminalMessage WebSocket 消息结构
 type TerminalMessage struct {
-	Type      string `json:"type"` // "input", "command", "connect"
+	Type      string `json:"type"` // "connect" or "input"
 	Data      string `json:"data"`
 	Namespace string `json:"namespace"`
 	Pod       string `json:"pod"`
@@ -93,13 +87,20 @@ type TerminalMessage struct {
 	Cluster   string `json:"cluster"`
 }
 
-// WSWriter WebSocket 写入器
-type WSWriter struct {
+// wsWriter is a thread-safe WebSocket writer implementing io.Writer.
+type wsWriter struct {
 	conn *websocket.Conn
-	mu   chan struct{}
+	mu   sync.Mutex
 }
 
-// ==================== 全局变量 ====================
+func (w *wsWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	err := w.conn.WriteMessage(websocket.TextMessage, p)
+	return len(p), err
+}
+
+// ==================== Global Variables ====================
 
 var (
 	dbConnection *sqlx.DB
@@ -108,311 +109,183 @@ var (
 	}
 )
 
-// ==================== 数据库操作 ====================
+// ==================== Database Operations ====================
 
-// InitDB 初始化数据库连接
 func InitDB(dsn string) error {
 	var err error
 	dbConnection, err = sqlx.Open("mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %v", err)
 	}
-
-	// 测试连接
 	if err := dbConnection.Ping(); err != nil {
 		return fmt.Errorf("failed to connect to database: %v", err)
 	}
-
-	// 设置连接池参数
 	dbConnection.SetMaxOpenConns(10)
 	dbConnection.SetMaxIdleConns(5)
-
 	log.Println("Database connection established successfully")
 	return nil
 }
 
-// GetClusterKubeconfig 通过集群名称从数据库获取 kubeconfig
 func GetClusterKubeconfig(clusterName string) (string, error) {
 	if dbConnection == nil {
 		return "", fmt.Errorf("database connection not initialized")
 	}
-
 	var cluster ClusterConfig
 	err := dbConnection.Get(&cluster,
 		"SELECT id, name, server, description, create_user, update_user, update_time, create_time, del_flag FROM `cluster` WHERE name = ? AND del_flag = 1 LIMIT 1",
 		clusterName)
-
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", fmt.Errorf("cluster '%s' not found", clusterName)
 		}
 		return "", fmt.Errorf("database query error: %v", err)
 	}
-
-	// Description 字段包含 kubeconfig 内容
 	if cluster.Description == "" {
 		return "", fmt.Errorf("cluster '%s' has no kubeconfig data", clusterName)
 	}
-
 	return cluster.Description, nil
 }
 
-// ListClusters 获取所有集群列表
 func ListClusters() ([]ClusterConfig, error) {
 	if dbConnection == nil {
 		return nil, fmt.Errorf("database connection not initialized")
 	}
-
 	var clusters []ClusterConfig
 	err := dbConnection.Select(&clusters,
 		"SELECT id, name, server, description, create_user, update_user, update_time, create_time, del_flag FROM `cluster` WHERE del_flag = 1 ORDER BY create_time DESC")
-
 	if err != nil {
 		return nil, fmt.Errorf("database query error: %v", err)
 	}
-
 	return clusters, nil
 }
 
-// ==================== Kubernetes 操作 ====================
-
-// GetKubeConfig 获取 kubeconfig，优先级：参数 > 数据库 > 本地 > 集群内
-func GetKubeConfig(kubeconfigPath string, clusterName string) (string, error) {
-	// 1. 如果直接提供了 kubeconfig 路径，验证其有效性
-	if kubeconfigPath != "" {
-		if _, err := os.Stat(kubeconfigPath); err == nil {
-			return kubeconfigPath, nil
-		}
+// GetClusterRestConfig builds a rest.Config from a named cluster stored in the database.
+// It parses the kubeconfig content in-memory without writing a temp file.
+func GetClusterRestConfig(clusterName string) (*rest.Config, error) {
+	content, err := GetClusterKubeconfig(clusterName)
+	if err != nil {
+		return nil, err
 	}
-
-	// 2. 如果提供了集群名称，从数据库获取
-	if clusterName != "" && dbConnection != nil {
-		content, err := GetClusterKubeconfig(clusterName)
-		if err == nil {
-			// 将内容写入临时文件
-			tempFile, err := os.CreateTemp("", "kubeconfig-*.yml")
-			if err != nil {
-				return "", err
-			}
-			defer tempFile.Close()
-			if _, err := tempFile.WriteString(content); err != nil {
-				return "", err
-			}
-			return tempFile.Name(), nil
-		}
+	apiConfig, err := clientcmd.Load([]byte(content))
+	if err != nil {
+		return nil, fmt.Errorf("invalid kubeconfig for cluster %q: %v", clusterName, err)
 	}
-
-	// 3. 尝试本地 kubeconfig
-	if home := homedir.HomeDir(); home != "" {
-		localConfig := home + "/.kube/config"
-		if _, err := os.Stat(localConfig); err == nil {
-			return localConfig, nil
-		}
-	}
-
-	// 4. 返回空字符串，让 clientcmd 使用集群内配置
-	return "", nil
+	return clientcmd.NewDefaultClientConfig(*apiConfig, &clientcmd.ConfigOverrides{}).ClientConfig()
 }
 
-// BuildRestConfig 构建 REST 配置
+// BuildRestConfig builds a rest.Config from a kubeconfig file path, or falls back to
+// in-cluster config when kubeconfigPath is empty.
 func BuildRestConfig(kubeconfigPath string) (*rest.Config, error) {
 	if kubeconfigPath != "" {
 		return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 	}
-	// 尝试集群内配置
 	return rest.InClusterConfig()
 }
 
-// GetContainerDirectoryInfo 获取容器目录信息
+// ==================== Kubernetes Operations ====================
+
 func GetContainerDirectoryInfo(
-	kubeconfig string,
-	namespace string,
-	podName string,
-	containerName string,
-	dirPath string,
+	config *rest.Config,
+	namespace, podName, containerName, dirPath string,
 	depth int,
 ) (string, string, error) {
-	// 加载 kubeconfig
-	fmt.Println("in GetContainerDirectoryInfo")
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to load kubeconfig: %v", err)
-	}
-
-	// 获取基本的目录列表
-	command := fmt.Sprintf("find %s -mindepth %d -maxdepth %d 2>/dev/null", dirPath, depth, depth)
-	stdout, stderr, err := execInPod(config, namespace, podName, containerName, command)
-
-	return stdout, stderr, err
+	command := fmt.Sprintf("find %s -mindepth %d -maxdepth %d -print 2>/dev/null", dirPath, depth, depth)
+	return execInPod(config, namespace, podName, containerName, command)
 }
 
-// execInPod 在 Pod 中执行命令
 func execInPod(
-        config *rest.Config,
-        namespace string,
-        podName string,
-        containerName string,
-        command string,
-) (string, string, error) {
-        clientSet, err := kubernetes.NewForConfig(config)
-        if err != nil {
-                return "", "", err
-        }
-
-        cmd := []string{"/bin/sh", "-c", command}
-        req := clientSet.CoreV1().RESTClient().Post().
-                Resource("pods").
-                Name(podName).
-                Namespace(namespace).
-                SubResource("exec").
-                Param("container", containerName)
-
-        req.VersionedParams(
-                &corev1.PodExecOptions{
-                        Command: cmd,
-                        Stdin:   false,
-                        Stdout:  true,
-                        Stderr:  true,
-                        TTY:     false,
-                },
-                scheme.ParameterCodec,
-        )
-
-        executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
-        if err != nil {
-                return "", "", err
-        }
-
-        var stdout, stderr strings.Builder
-        err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
-                Stdin:  nil,
-                Stdout: &stdout,
-                Stderr: &stderr,
-        })
-
-        return stdout.String(), stderr.String(), err
-}
-
-
-// ExecInteractiveTerminal 在容器中执行交互式终端会话
-func ExecInteractiveTerminal(
 	config *rest.Config,
-	namespace string,
-	podName string,
-	containerName string,
-	stdin io.Reader,
-	stdout io.Writer,
-	stderr io.Writer,
-) error {
+	namespace, podName, containerName, command string,
+) (string, string, error) {
 	clientSet, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return err
+		return "", "", err
 	}
-
+	cmd := []string{"/bin/sh", "-c", command}
 	req := clientSet.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(podName).
 		Namespace(namespace).
 		SubResource("exec").
 		Param("container", containerName)
+	req.VersionedParams(
+		&corev1.PodExecOptions{Command: cmd, Stdin: false, Stdout: true, Stderr: true, TTY: false},
+		scheme.ParameterCodec,
+	)
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return "", "", err
+	}
+	var stdout, stderr strings.Builder
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return stdout.String(), stderr.String(), err
+}
 
+func ExecInteractiveTerminal(
+	config *rest.Config,
+	namespace, podName, containerName string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+) error {
+	clientSet, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+	req := clientSet.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		Param("container", containerName)
 	req.VersionedParams(
 		&corev1.PodExecOptions{
 			Command: []string{"/bin/sh"},
-			Stdin:   true,
-			Stdout:  true,
-			Stderr:  true,
-			TTY:     true,
+			Stdin:   true, Stdout: true, Stderr: true, TTY: true,
 		},
 		scheme.ParameterCodec,
 	)
-
 	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	if err != nil {
 		return err
 	}
-
-	stream := remotecommand.StreamOptions{
-		Stdin:  stdin,
-		Stdout: stdout,
-		Stderr: stderr,
-		Tty:    true,
-	}
-
-	return executor.StreamWithContext(context.Background(), stream)
+	return executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdin: stdin, Stdout: stdout, Stderr: stderr, Tty: true,
+	})
 }
 
-// ==================== WebSocket 操作 ====================
+// ==================== WebSocket Terminal Handler ====================
 
-// Write 实现 io.Writer 接口
-func (w *WSWriter) Write(p []byte) (int, error) {
-	w.mu <- struct{}{}
-	defer func() { <-w.mu }()
-
-	err := w.conn.WriteMessage(websocket.TextMessage, p)
-	return len(p), err
-}
-
-// Close 关闭连接
-func (w *WSWriter) Close() error {
-	return w.conn.Close()
-}
-
-// PipeReader 和 PipeWriter 的包装
-type PipeReadWriter struct {
-	*io.PipeReader
-	*io.PipeWriter
-}
-
-// ==================== HTTP 处理器 ====================
-
-// wsTerminalHandler WebSocket 终端处理器
 func wsHandler(c *gin.Context) {
-
-	w := c.Writer
-	r := c.Request
-
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
 	defer conn.Close()
 
-	ns := c.Query("namespace")
+	// Prefer URL query params; fall back to an initial "connect" message.
+	namespace := c.Query("namespace")
 	pod := c.Query("pod")
 	container := c.Query("container")
 	clusterName := c.Query("cluster")
 
-
-	// 方式 1: 尝试从 URL 查询参数获取连接信息
-	namespace := c.Query("namespace")
-	//pod := c.Query("pod")
-	//container := c.Query("container")
-	//clusterName := c.Query("cluster")
-
-	// 方式 2: 如果查询参数不完整，尝试从 WebSocket 消息获取
 	if namespace == "" || pod == "" || container == "" {
 		var msg TerminalMessage
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		err = conn.ReadJSON(&msg)
+		if err := conn.ReadJSON(&msg); err != nil {
+			log.Printf("Failed to read initial message: %v", err)
+			_ = conn.WriteJSON(gin.H{"error": "missing connection parameters in URL or message"})
+			return
+		}
 		conn.SetReadDeadline(time.Time{})
 
-		if err != nil {
-			log.Printf("Failed to read initial message: %v", err)
-			conn.WriteJSON(gin.H{
-				"error": "Missing connection parameters in URL or message",
-			})
-			return
-		}
-
 		if msg.Type != "connect" {
-			conn.WriteJSON(gin.H{
-				"error": "First message must be 'connect' type",
-			})
+			_ = conn.WriteJSON(gin.H{"error": "first message must be type 'connect'"})
 			return
 		}
-
 		namespace = msg.Namespace
 		pod = msg.Pod
 		container = msg.Container
@@ -422,436 +295,188 @@ func wsHandler(c *gin.Context) {
 	}
 
 	if namespace == "" || pod == "" || container == "" {
-		conn.WriteJSON(gin.H{
-			"error": "Missing required fields: namespace, pod, container",
-		})
+		_ = conn.WriteJSON(gin.H{"error": "missing required fields: namespace, pod, container"})
 		return
 	}
 
-	// 获取 kubeconfig
-	kubeconfigPath, err := GetKubeConfig("", clusterName)
-	if err != nil {
-		conn.WriteJSON(gin.H{
-			"error": fmt.Sprintf("Failed to get kubeconfig: %v", err),
-		})
-		return
+	// Resolve rest.Config from DB cluster name or local/in-cluster kubeconfig.
+	var config *rest.Config
+	if clusterName != "" {
+		config, err = GetClusterRestConfig(clusterName)
+	} else {
+		config, err = BuildRestConfig("")
 	}
-
-	// 构建 REST 配置
-	config, err := BuildRestConfig(kubeconfigPath)
 	if err != nil {
-		conn.WriteJSON(gin.H{
-			"error": fmt.Sprintf("Failed to build kube config: %v", err),
-		})
+		_ = conn.WriteJSON(gin.H{"error": fmt.Sprintf("failed to build kube config: %v", err)})
 		return
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatal(err)
+		_ = conn.WriteJSON(gin.H{"error": fmt.Sprintf("failed to create k8s client: %v", err)})
+		return
 	}
 
-	req := clientset.CoreV1().
-		RESTClient().
-		Post().
+	req := clientset.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(pod).
-		Namespace(ns).
+		Namespace(namespace).
 		SubResource("exec")
-
 	req.VersionedParams(&corev1.PodExecOptions{
-
 		Container: container,
 		Command:   []string{"/bin/sh"},
-
-		Stdin:  true,
-		Stdout: true,
-		Stderr: true,
-		TTY:    true,
-
+		Stdin:     true, Stdout: true, Stderr: true, TTY: true,
 	}, scheme.ParameterCodec)
 
 	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	if err != nil {
-		log.Println(err)
+		log.Printf("SPDY executor error: %v", err)
 		return
 	}
 
 	reader, writer := io.Pipe()
-
 	go func() {
-
+		defer writer.Close()
 		for {
-
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
-
-			writer.Write(msg)
-
+			if _, err := writer.Write(msg); err != nil {
+				return
+			}
 		}
-
 	}()
 
-	stream := remotecommand.StreamOptions{
-
+	ww := &wsWriter{conn: conn}
+	if err := exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
 		Stdin:  reader,
-		Stdout: wsWriter{conn},
-		Stderr: wsWriter{conn},
+		Stdout: ww,
+		Stderr: ww,
 		Tty:    true,
-	}
-
-	err = exec.StreamWithContext(context.Background(), stream)
-	if err != nil {
-		log.Println(err)
+	}); err != nil {
+		log.Printf("terminal stream error: %v", err)
 	}
 }
 
-type wsWriter struct {
-	conn *websocket.Conn
-}
+// ==================== Directory Query Handler ====================
 
-func (w wsWriter) Write(p []byte) (int, error) {
-
-	err := w.conn.WriteMessage(websocket.TextMessage, p)
-
-	return len(p), err
-}
-
-
-
-// queryDirectory 处理查询目录的请求
 func queryDirectory(c *gin.Context) {
 	var req DirectoryRequest
-    fmt.Println("in queryDirectory")
-	// 绑定 JSON 请求体
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, DirectoryResponse{
-			Success: false,
-			Error:   "Invalid request format",
-			Message: err.Error(),
+			Success: false, Error: "invalid request format", Message: err.Error(),
 		})
 		return
 	}
 
-	// 验证路径安全性
-	if strings.Contains(req.DirPath, "..") {
+	// Reject path traversal and shell metacharacters to prevent command injection.
+	if strings.Contains(req.DirPath, "..") || strings.ContainsAny(req.DirPath, ";|&`$\\") {
 		c.JSON(http.StatusBadRequest, DirectoryResponse{
-			Success: false,
-			Error:   "Invalid path",
-			Message: "Path traversal is not allowed",
+			Success: false, Error: "invalid path",
+			Message: "path traversal and shell metacharacters are not allowed",
 		})
 		return
 	}
 
-	// 获取 kubeconfig
-	kubeconfig, err := GetKubeConfig(req.Kubeconfig, req.ClusterName)
+	var (
+		config *rest.Config
+		err    error
+	)
+	switch {
+	case req.ClusterName != "":
+		config, err = GetClusterRestConfig(req.ClusterName)
+	case req.Kubeconfig != "":
+		config, err = BuildRestConfig(req.Kubeconfig)
+	default:
+		config, err = BuildRestConfig("")
+	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, DirectoryResponse{
-			Success: false,
-			Error:   "Failed to get kubeconfig",
-			Message: err.Error(),
+			Success: false, Error: "failed to get kubeconfig", Message: err.Error(),
 		})
 		return
 	}
 
-	if kubeconfig == "" {
-		c.JSON(http.StatusBadRequest, DirectoryResponse{
-			Success: false,
-			Error:   "Missing kubeconfig",
-			Message: "Either provide 'kubeconfig' path or 'cluster_name'",
-		})
-		return
-	}
-
-	// 执行查询
 	stdout, stderr, err := GetContainerDirectoryInfo(
-		kubeconfig,
-		req.Namespace,
-		req.PodName,
-		req.ContainerName,
-		req.DirPath,
-		req.Depth,
+		config, req.Namespace, req.PodName, req.ContainerName, req.DirPath, req.Depth,
 	)
-
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, DirectoryResponse{
-			Success: false,
-			Error:   "Failed to execute command",
-			Message: err.Error(),
-			Details: ErrorDetail{
-				Stdout: stdout,
-				Stderr: stderr,
-			},
+			Success: false, Error: "failed to execute command", Message: err.Error(),
+			Details: ErrorDetail{Stdout: stdout, Stderr: stderr},
 		})
 		return
 	}
 
 	if stdout == "" && stderr != "" {
 		c.JSON(http.StatusInternalServerError, DirectoryResponse{
-			Success: false,
-			Error:   "Command execution returned error",
-			Message: "Check stderr for details",
-			Details: ErrorDetail{
-				Stdout: stdout,
-				Stderr: stderr,
-			},
+			Success: false, Error: "command returned error",
+			Details: ErrorDetail{Stdout: stdout, Stderr: stderr},
 		})
 		return
 	}
 
-	// 解析路径数据
 	pathItems := ParsePathsFromOutput(stdout)
-
-	// 检查是否要求返回原始数据
-	includeRaw := c.Query("raw") == "true"
-
-	responseData := gin.H{
-		"paths": pathItems,
-		"count": len(pathItems),
-	}
-
-	if includeRaw {
+	responseData := gin.H{"paths": pathItems, "count": len(pathItems)}
+	if c.Query("raw") == "true" {
 		responseData["raw"] = stdout
 	}
-
 	c.JSON(http.StatusOK, DirectoryResponse{
-		Success: true,
-		Data:    responseData,
-		Message: "Directory information retrieved successfully",
-		Details: ErrorDetail{
-			Stderr: stderr,
-		},
+		Success: true, Data: responseData,
+		Message: "directory information retrieved successfully",
+		Details: ErrorDetail{Stderr: stderr},
 	})
 }
 
-// ParsePathsFromOutput 解析 find 命令输出为结构化数据
+// ParsePathsFromOutput parses find(1) output into structured PathItems.
+// Type detection uses name heuristics only; it is not authoritative.
 func ParsePathsFromOutput(output string) []PathItem {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	paths := make([]PathItem, 0, len(lines))
-
 	for _, line := range lines {
 		if line == "" {
 			continue
 		}
-
 		parts := strings.Split(line, "/")
 		name := parts[len(parts)-1]
 		if name == "" {
 			name = "/"
 		}
-
 		itemType := "directory"
 		if strings.Contains(name, ".") {
 			itemType = "file"
-		} else if strings.HasPrefix(name, ".") && len(name) > 1 {
-			itemType = "file"
 		}
-
-		paths = append(paths, PathItem{
-			Path: line,
-			Name: name,
-			Type: itemType,
-		})
+		paths = append(paths, PathItem{Path: line, Name: name, Type: itemType})
 	}
-
 	return paths
 }
 
-// healthCheck 健康检查端点
-func healthCheck(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
-		"message": "Container Directory API is running",
-	})
-}
+// ==================== API Documentation ====================
 
-// listClusters 获取集群列表
-func listClusters(c *gin.Context) {
-	clusters, err := ListClusters()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"error":   "Failed to fetch clusters",
-			"message": err.Error(),
-		})
-		return
-	}
-
-	responses := make([]ClusterResponse, len(clusters))
-	for i, cluster := range clusters {
-		responses[i] = ClusterResponse{
-			ID:         cluster.ID,
-			Name:       cluster.Name,
-			Server:     cluster.Server,
-			CreateUser: cluster.CreateUser,
-			UpdateUser: cluster.UpdateUser,
-			UpdateTime: cluster.UpdateTime,
-			CreateTime: cluster.CreateTime,
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    responses,
-		"count":   len(responses),
-		"message": "Clusters fetched successfully",
-	})
-}
-
-// apiDoc 获取 API 文档
 func apiDoc(c *gin.Context) {
-	doc := gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"api_version": "2.0",
-		"title":       "Container Directory API with Terminal",
-		"description": "Query directory information and access interactive terminals from Kubernetes containers",
+		"title":       "Ceph PVC Copier & Container Terminal API",
 		"database": gin.H{
 			"enabled":     dbConnection != nil,
-			"description": "MySQL database for cluster configuration storage",
+			"description": "MySQL database for cluster kubeconfig storage",
 		},
 		"endpoints": []gin.H{
-			{
-				"path":        "/health",
-				"method":      "GET",
-				"description": "Health check endpoint",
-				"response": gin.H{
-					"status":  "ok",
-					"message": "Container Directory API is running",
-				},
-			},
-			{
-				"path":        "/api/v1/clusters",
-				"method":      "GET",
-				"description": "Get list of all available clusters",
-			},
-			{
-				"path":        "/api/v1/directory",
-				"method":      "POST",
-				"description": "Query directory information from a container",
-				"request_body": gin.H{
-					"cluster_name":   "string (optional) - Cluster name",
-					"kubeconfig":     "string (optional) - Path to kubeconfig",
-					"namespace":      "string (required) - Kubernetes namespace",
-					"pod_name":       "string (required) - Pod name",
-					"container_name": "string (required) - Container name",
-					"dir_path":       "string (required) - Directory path",
-					"depth":          "integer (required, 0-10) - Find depth",
-				},
-			},
-			{
-				"path":        "/api/v1/terminal",
-				"method":      "WebSocket",
-				"description": "Interactive terminal access to container",
-				"protocol":    "ws:// or wss://",
-				"initial_message": gin.H{
-					"type":      "connect",
-					"cluster":   "string (optional) - Cluster name",
-					"namespace": "string (required) - Kubernetes namespace",
-					"pod":       "string (required) - Pod name",
-					"container": "string (required) - Container name",
-				},
-				"input_message": gin.H{
-					"type": "input",
-					"data": "string - Command input",
-				},
-			},
-			{
-				"path":        "/api/v1/docs",
-				"method":      "GET",
-				"description": "API documentation",
-			},
+			{"method": "GET", "path": "/health", "description": "health check"},
+			{"method": "GET", "path": "/api/v1/docs", "description": "API documentation"},
+			{"method": "GET", "path": "/api/v1/clusters", "description": "list registered K8s clusters"},
+			{"method": "POST", "path": "/api/v1/clusters", "description": "register a K8s cluster"},
+			{"method": "DELETE", "path": "/api/v1/clusters/:name", "description": "remove a cluster"},
+			{"method": "GET", "path": "/api/v1/clusters/:name/pvcs", "description": "list PVCs in cluster"},
+			{"method": "GET", "path": "/api/v1/ceph", "description": "get Ceph configuration"},
+			{"method": "POST", "path": "/api/v1/ceph", "description": "set Ceph configuration"},
+			{"method": "POST", "path": "/api/v1/copy", "description": "start PVC copy task"},
+			{"method": "GET", "path": "/api/v1/copy/:task_id", "description": "get task status"},
+			{"method": "POST", "path": "/api/v1/copy/:task_id/cancel", "description": "cancel task"},
+			{"method": "GET", "path": "/api/v1/tasks", "description": "list all tasks"},
+			{"method": "POST", "path": "/api/v1/directory", "description": "query container directory"},
+			{"method": "WebSocket", "path": "/api/v1/terminal", "description": "interactive container terminal"},
 		},
-		"example_requests": []gin.H{
-			{
-				"description": "Query directory using cluster name",
-				"method":      "POST",
-				"url":         "/api/v1/directory",
-				"body": gin.H{
-					"cluster_name":   "production",
-					"namespace":      "default",
-					"pod_name":       "redis-master-0",
-					"container_name": "redis",
-					"dir_path":       "/",
-					"depth":          2,
-				},
-			},
-			{
-				"description": "WebSocket terminal connection",
-				"method":      "WebSocket",
-				"url":         "ws://localhost:8088/api/v1/terminal",
-				"steps": []string{
-					"Connect to WebSocket",
-					"Send: {\"type\": \"connect\", \"cluster\": \"production\", \"namespace\": \"default\", \"pod\": \"redis-master-0\", \"container\": \"redis\"}",
-					"Send: {\"type\": \"input\", \"data\": \"ls -la\\n\"}",
-				},
-			},
-		},
-	}
-
-	c.JSON(http.StatusOK, doc)
-}
-
-// ==================== 主函数 ====================
-
-func main() {
-	// 初始化数据库
-	dbDSN := os.Getenv("DB_DSN")
-	if dbDSN != "" {
-		if err := InitDB(dbDSN); err != nil {
-			log.Printf("Warning: Database initialization failed: %v", err)
-			log.Println("Continuing without database support.")
-		}
-	} else {
-		log.Println("No DB_DSN provided. Database support disabled.")
-	}
-
-	// 设置 Gin 运行模式
-	gin.SetMode(gin.ReleaseMode)
-
-	// 创建 Gin 引擎
-	router := gin.New()
-
-	// 添加中间件
-	router.Use(gin.Logger())
-	router.Use(gin.Recovery())
-
-	// 添加 CORS 中间件
-	router.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-
-		c.Next()
 	})
-
-	// 注册路由
-	router.GET("/health", healthCheck)
-	router.GET("/api/v1/docs", apiDoc)
-	router.GET("/api/v1/clusters", listClusters)
-	router.POST("/api/v1/directory", queryDirectory)
-	router.GET("/api/v1/terminal", func(c *gin.Context) {
-		wsHandler(c)
-	})
-
-	// 启动服务器
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8088"
-	}
-
-	address := "0.0.0.0:" + port
-
-	log.Printf("Starting Container Directory API server on %s", address)
-	log.Printf("API documentation available at http://0.0.0.0:%s/api/v1/docs", port)
-	log.Printf("WebSocket terminal available at ws://0.0.0.0:%s/api/v1/terminal", port)
-
-	if err := router.Run(address); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
-	}
 }
