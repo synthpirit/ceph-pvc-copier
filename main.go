@@ -415,6 +415,7 @@ func (s *Server) registerRoutes() {
 
 	// Terminal features (handlers defined in terminal.go)
 	s.router.POST("/api/v1/directory", queryDirectory)
+	s.router.POST("/api/v1/file", getFileContent)
 	s.router.GET("/api/v1/terminal", wsHandler)
 }
 
@@ -814,15 +815,11 @@ func (s *Server) validateCopyRequest(r *CopyRequest) error {
 	if r.DstCluster == "" || r.DstNS == "" || r.DstPVC == "" {
 		return fmt.Errorf("dst_cluster, dst_ns, dst_pvc are required")
 	}
-	s.k8sClusterMu.RLock()
-	_, srcOk := s.k8sClusters[r.SrcCluster]
-	_, dstOk := s.k8sClusters[r.DstCluster]
-	s.k8sClusterMu.RUnlock()
-	if !srcOk {
-		return fmt.Errorf("source cluster %q not registered", r.SrcCluster)
+	if err := s.clusterExists(r.SrcCluster); err != nil {
+		return fmt.Errorf("source cluster %q not found: %v", r.SrcCluster, err)
 	}
-	if !dstOk {
-		return fmt.Errorf("destination cluster %q not registered", r.DstCluster)
+	if err := s.clusterExists(r.DstCluster); err != nil {
+		return fmt.Errorf("destination cluster %q not found: %v", r.DstCluster, err)
 	}
 	s.cephMu.RLock()
 	cephOk := s.cephConfig != nil
@@ -831,6 +828,18 @@ func (s *Server) validateCopyRequest(r *CopyRequest) error {
 		return fmt.Errorf("ceph is not configured (POST /api/v1/ceph first)")
 	}
 	return nil
+}
+
+// clusterExists returns nil if the cluster is reachable via in-memory registry or database.
+func (s *Server) clusterExists(name string) error {
+	s.k8sClusterMu.RLock()
+	_, ok := s.k8sClusters[name]
+	s.k8sClusterMu.RUnlock()
+	if ok {
+		return nil
+	}
+	_, err := GetClusterRestConfig(name)
+	return err
 }
 
 // getK8sClient returns a cached client, creating one from the in-memory registry or

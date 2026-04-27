@@ -54,6 +54,16 @@ type ErrorDetail struct {
 	Stderr string `json:"stderr,omitempty"`
 }
 
+// FileRequest 读取容器内文件内容的请求
+type FileRequest struct {
+	ClusterName   string `json:"cluster_name"`
+	Kubeconfig    string `json:"kubeconfig"`
+	Namespace     string `json:"namespace" binding:"required"`
+	PodName       string `json:"pod_name" binding:"required"`
+	ContainerName string `json:"container_name" binding:"required"`
+	FilePath      string `json:"file_path" binding:"required"`
+}
+
 // ClusterConfig maps to the `cluster` table in MySQL.
 // The Description field stores the kubeconfig YAML content.
 type ClusterConfig struct {
@@ -224,6 +234,40 @@ func execInPod(
 	return stdout.String(), stderr.String(), err
 }
 
+// execInPodArgs execs a command directly in a pod without wrapping it in a shell.
+// Use this instead of execInPod when the arguments are controlled by the caller
+// to avoid shell injection entirely.
+func execInPodArgs(
+	config *rest.Config,
+	namespace, podName, containerName string,
+	args []string,
+) (string, string, error) {
+	clientSet, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return "", "", err
+	}
+	req := clientSet.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		Param("container", containerName)
+	req.VersionedParams(
+		&corev1.PodExecOptions{Command: args, Stdin: false, Stdout: true, Stderr: true, TTY: false},
+		scheme.ParameterCodec,
+	)
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return "", "", err
+	}
+	var stdout, stderr strings.Builder
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return stdout.String(), stderr.String(), err
+}
+
 func ExecInteractiveTerminal(
 	config *rest.Config,
 	namespace, podName, containerName string,
@@ -359,6 +403,87 @@ func wsHandler(c *gin.Context) {
 	}
 }
 
+// ==================== File Content Handler ====================
+
+// maxFileReadSize limits how many bytes are returned from a single file read.
+const maxFileReadSize = 10 * 1024 * 1024 // 10 MB
+
+// getFileContent reads a file from inside a container and returns its content.
+// The exec is done without a shell to prevent injection.
+func getFileContent(c *gin.Context) {
+	var req FileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false, "error": "invalid request format", "message": err.Error(),
+		})
+		return
+	}
+
+	if strings.Contains(req.FilePath, "..") || strings.ContainsAny(req.FilePath, ";|&`$\\") {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false, "error": "invalid path",
+			"message": "path traversal and shell metacharacters are not allowed",
+		}))
+		return
+	}
+
+	var (
+		config *rest.Config
+		err    error
+	)
+	switch {
+	case req.ClusterName != "":
+		config, err = GetClusterRestConfig(req.ClusterName)
+	case req.Kubeconfig != "":
+		config, err = BuildRestConfig(req.Kubeconfig)
+	default:
+		config, err = BuildRestConfig("")
+	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false, "error": "failed to get kubeconfig", "message": err.Error(),
+		})
+		return
+	}
+
+	// cat is called directly (no shell) so the file path cannot be used for injection.
+	stdout, stderr, err := execInPodArgs(
+		config, req.Namespace, req.PodName, req.ContainerName,
+		[]string{"cat", req.FilePath},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false, "error": "failed to read file",
+			"message": err.Error(), "stderr": stderr,
+		})
+		return
+	}
+	if stdout == "" && stderr != "" {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false, "error": "file read returned error", "stderr": stderr,
+		})
+		return
+	}
+
+	truncated := false
+	content := stdout
+	if len(content) > maxFileReadSize {
+		content = content[:maxFileReadSize]
+		truncated = true
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"content":   content,
+			"size":      len(stdout),
+			"path":      req.FilePath,
+			"truncated": truncated,
+		},
+		"message": "file content retrieved successfully",
+	})
+}
+
 // ==================== Directory Query Handler ====================
 
 func queryDirectory(c *gin.Context) {
@@ -476,6 +601,7 @@ func apiDoc(c *gin.Context) {
 			{"method": "POST", "path": "/api/v1/copy/:task_id/cancel", "description": "cancel task"},
 			{"method": "GET", "path": "/api/v1/tasks", "description": "list all tasks"},
 			{"method": "POST", "path": "/api/v1/directory", "description": "query container directory"},
+			{"method": "POST", "path": "/api/v1/file", "description": "read file content from container (max 10 MB)"},
 			{"method": "WebSocket", "path": "/api/v1/terminal", "description": "interactive container terminal"},
 		},
 	})
