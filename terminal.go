@@ -423,7 +423,7 @@ func getFileContent(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false, "error": "invalid path",
 			"message": "path traversal and shell metacharacters are not allowed",
-		}))
+		})
 		return
 	}
 
@@ -596,7 +596,10 @@ func apiDoc(c *gin.Context) {
 			{"method": "GET", "path": "/api/v1/clusters/:name/pvcs", "description": "list PVCs in cluster"},
 			{"method": "GET", "path": "/api/v1/ceph", "description": "get Ceph configuration"},
 			{"method": "POST", "path": "/api/v1/ceph", "description": "set Ceph configuration"},
-			{"method": "POST", "path": "/api/v1/copy", "description": "start PVC copy task"},
+			{"method": "GET", "path": "/api/v1/clusters/:cluster/namespaces/:ns/pvcs/:pvc/snapshots", "description": "list RBD snapshots of a PVC"},
+		{"method": "POST", "path": "/api/v1/clusters/:cluster/namespaces/:ns/pvcs/:pvc/snapshots", "description": "create RBD snapshot (snap_name optional)"},
+		{"method": "DELETE", "path": "/api/v1/clusters/:cluster/namespaces/:ns/pvcs/:pvc/snapshots/:snap", "description": "delete RBD snapshot"},
+		{"method": "POST", "path": "/api/v1/copy", "description": "start PVC copy task"},
 			{"method": "GET", "path": "/api/v1/copy/:task_id", "description": "get task status"},
 			{"method": "POST", "path": "/api/v1/copy/:task_id/cancel", "description": "cancel task"},
 			{"method": "GET", "path": "/api/v1/tasks", "description": "list all tasks"},

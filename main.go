@@ -58,6 +58,19 @@ type CephConfig struct {
 	Pool     string `json:"pool"`
 }
 
+// SnapshotInfo represents a single RBD snapshot.
+type SnapshotInfo struct {
+	ID   uint64 `json:"id"`
+	Name string `json:"name"`
+	Size uint64 `json:"size"`
+}
+
+// CreateSnapshotRequest is the body for POST …/snapshots.
+// SnapName is optional; a timestamp-based name is generated when omitted.
+type CreateSnapshotRequest struct {
+	SnapName string `json:"snap_name"`
+}
+
 // ============================================================================
 // Ceph Client
 // ============================================================================
@@ -400,8 +413,8 @@ func (s *Server) registerRoutes() {
 	// K8s cluster management (in-memory registry for PVC copy)
 	s.router.GET("/api/v1/clusters", s.handleListClusters)
 	s.router.POST("/api/v1/clusters", s.handleAddCluster)
-	s.router.DELETE("/api/v1/clusters/:name", s.handleDeleteCluster)
-	s.router.GET("/api/v1/clusters/:name/pvcs", s.handleListPVCs)
+	s.router.DELETE("/api/v1/clusters/:cluster", s.handleDeleteCluster)
+	s.router.GET("/api/v1/clusters/:cluster/pvcs", s.handleListPVCs)
 
 	// Ceph config (shared across all clusters)
 	s.router.GET("/api/v1/ceph", s.handleGetCeph)
@@ -412,6 +425,12 @@ func (s *Server) registerRoutes() {
 	s.router.GET("/api/v1/copy/:task_id", s.handleGetTask)
 	s.router.POST("/api/v1/copy/:task_id/cancel", s.handleCancelTask)
 	s.router.GET("/api/v1/tasks", s.handleListTasks)
+
+	// RBD snapshot management: /api/v1/clusters/:cluster/namespaces/:ns/pvcs/:pvc/snapshots[/:snap]
+	snapBase := "/api/v1/clusters/:cluster/namespaces/:ns/pvcs/:pvc/snapshots"
+	s.router.GET(snapBase, s.handleListSnapshots)
+	s.router.POST(snapBase, s.handleCreateSnapshot)
+	s.router.DELETE(snapBase+"/:snap", s.handleDeleteSnapshot)
 
 	// Terminal features (handlers defined in terminal.go)
 	s.router.POST("/api/v1/directory", queryDirectory)
@@ -486,7 +505,7 @@ func (s *Server) handleAddCluster(c *gin.Context) {
 }
 
 func (s *Server) handleDeleteCluster(c *gin.Context) {
-	name := c.Param("name")
+	name := c.Param("cluster")
 	s.k8sClusterMu.Lock()
 	delete(s.k8sClusters, name)
 	s.k8sClusterMu.Unlock()
@@ -497,7 +516,7 @@ func (s *Server) handleDeleteCluster(c *gin.Context) {
 }
 
 func (s *Server) handleListPVCs(c *gin.Context) {
-	name := c.Param("name")
+	name := c.Param("cluster")
 	ns := c.DefaultQuery("namespace", "default")
 
 	client, err := s.getK8sClient(name)
@@ -802,6 +821,163 @@ func (s *Server) executeCopy(task *CopyTask) {
 		task.Request.DstNS, task.Request.DstPVC, dstImageName)
 	task.mu.Unlock()
 	log.Printf("[%s] Completed successfully", task.ID)
+}
+
+// ============================================================================
+// Handlers – RBD Snapshots
+// ============================================================================
+
+// newCephClientForPool returns a CephClient opened on the given pool.
+// Falls back to the globally configured pool when pool is empty.
+func (s *Server) newCephClientForPool(pool string) (*CephClient, error) {
+	s.cephMu.RLock()
+	cfg := s.cephConfig
+	s.cephMu.RUnlock()
+	if cfg == nil {
+		return nil, fmt.Errorf("ceph is not configured (POST /api/v1/ceph first)")
+	}
+	cfgCopy := *cfg
+	if pool != "" && pool != cfgCopy.Pool {
+		cfgCopy.Pool = pool
+	}
+	return NewCephClient(&cfgCopy)
+}
+
+// snapshotParams extracts the three common path params and returns the RBD image info.
+func (s *Server) snapshotParams(c *gin.Context) (*RBDImageInfo, error) {
+	cluster := c.Param("cluster")
+	ns := c.Param("ns")
+	pvc := c.Param("pvc")
+
+	k8sClient, err := s.getK8sClient(cluster)
+	if err != nil {
+		return nil, fmt.Errorf("cluster %q: %w", cluster, err)
+	}
+	rbdInfo, _, err := GetRBDImageFromPVC(c.Request.Context(), k8sClient, ns, pvc)
+	if err != nil {
+		return nil, fmt.Errorf("PVC %s/%s: %w", ns, pvc, err)
+	}
+	return rbdInfo, nil
+}
+
+func (s *Server) handleListSnapshots(c *gin.Context) {
+	rbdInfo, err := s.snapshotParams(c)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	cephClient, err := s.newCephClientForPool(rbdInfo.Pool)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer cephClient.Close()
+
+	img, err := rbd.OpenImage(cephClient.ioctx, rbdInfo.ImageName, rbd.NoSnapshot)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to open image: %v", err)})
+		return
+	}
+	defer img.Close()
+
+	snaps, err := img.GetSnapshotNames()
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to list snapshots: %v", err)})
+		return
+	}
+
+	list := make([]SnapshotInfo, 0, len(snaps))
+	for _, sn := range snaps {
+		list = append(list, SnapshotInfo{ID: sn.Id, Name: sn.Name, Size: sn.Size})
+	}
+	c.JSON(200, gin.H{
+		"image":     rbdInfo.ImageName,
+		"pool":      rbdInfo.Pool,
+		"snapshots": list,
+		"count":     len(list),
+	})
+}
+
+func (s *Server) handleCreateSnapshot(c *gin.Context) {
+	rbdInfo, err := s.snapshotParams(c)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	var req CreateSnapshotRequest
+	_ = c.ShouldBindJSON(&req) // body is optional
+	if req.SnapName == "" {
+		req.SnapName = fmt.Sprintf("snap-%d", time.Now().Unix())
+	}
+
+	cephClient, err := s.newCephClientForPool(rbdInfo.Pool)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer cephClient.Close()
+
+	img, err := rbd.OpenImage(cephClient.ioctx, rbdInfo.ImageName, rbd.NoSnapshot)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to open image: %v", err)})
+		return
+	}
+	defer img.Close()
+
+	if _, err := img.CreateSnapshot(req.SnapName); err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to create snapshot: %v", err)})
+		return
+	}
+
+	c.JSON(201, gin.H{
+		"message":    "snapshot created",
+		"snap_name":  req.SnapName,
+		"image":      rbdInfo.ImageName,
+		"pool":       rbdInfo.Pool,
+		"created_at": time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Server) handleDeleteSnapshot(c *gin.Context) {
+	rbdInfo, err := s.snapshotParams(c)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	snapName := c.Param("snap")
+
+	cephClient, err := s.newCephClientForPool(rbdInfo.Pool)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer cephClient.Close()
+
+	img, err := rbd.OpenImage(cephClient.ioctx, rbdInfo.ImageName, rbd.NoSnapshot)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to open image: %v", err)})
+		return
+	}
+	defer img.Close()
+
+	snap := img.GetSnapshot(snapName)
+
+	// Unprotect before removal if needed (a protected snapshot cannot be deleted).
+	if protected, err := snap.IsProtected(); err == nil && protected {
+		if err := snap.Unprotect(); err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to unprotect snapshot: %v", err)})
+			return
+		}
+	}
+
+	if err := snap.Remove(); err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to delete snapshot: %v", err)})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "snapshot deleted", "snap_name": snapName})
 }
 
 // ============================================================================
