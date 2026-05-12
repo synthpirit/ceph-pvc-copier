@@ -249,7 +249,8 @@ func GetRBDImageFromPVC(ctx context.Context, client kubernetes.Interface, namesp
 func CreatePVCFromRBDImage(
 	ctx context.Context,
 	client kubernetes.Interface,
-	namespace, pvcName, rbdImage string,
+	namespace, pvcName string,
+	rbdImage string,
 	srcPVC *corev1.PersistentVolumeClaim,
 	srcPV *corev1.PersistentVolume,
 ) error {
@@ -258,27 +259,52 @@ func CreatePVCFromRBDImage(
 	}
 
 	pvName := fmt.Sprintf("pv-%s-%s-%d", namespace, pvcName, time.Now().Unix())
+
+	srcAttrs := srcPV.Spec.CSI.VolumeAttributes
+	newAttrs := map[string]string{
+		"clusterID":     srcAttrs["clusterID"],
+		"pool":          srcAttrs["pool"],
+		"imageName":     rbdImage,
+		"imageFeatures": srcAttrs["imageFeatures"],
+		"imageFormat":   "2",
+		// staticVolume=true 让 ceph-csi 跳过 VolumeHandle 解析，直接用 imageName 挂载
+		"staticVolume": "true",
+	}
+	if v := srcAttrs["journalPool"]; v != "" {
+		newAttrs["journalPool"] = v
+	}
+	for _, k := range []string{"mounter", "mapOptions", "unmapOptions",
+		"encrypted", "encryptionKMSID", "tryOtherMounters"} {
+		if v := srcAttrs[k]; v != "" {
+			newAttrs[k] = v
+		}
+	}
+
+	volumeHandle := rbdImage
+
 	newPV := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: pvName,
 			Annotations: map[string]string{
-				"pv.kubernetes.io/provisioned-by": srcPV.Annotations["pv.kubernetes.io/provisioned-by"],
-				"copied-from-image":               srcPV.Spec.CSI.VolumeAttributes["imageName"],
+				"pv.kubernetes.io/provisioned-by": srcPV.Spec.CSI.Driver,
+				"copied-from-image":               srcAttrs["imageName"],
+				"copied-from-pvc":                 fmt.Sprintf("%s/%s", srcPVC.Namespace, srcPVC.Name),
 				"copied-at":                       time.Now().Format(time.RFC3339),
 			},
 		},
 		Spec: corev1.PersistentVolumeSpec{
 			Capacity:                      srcPV.Spec.Capacity,
 			AccessModes:                   srcPV.Spec.AccessModes,
-			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
 			StorageClassName:              srcPV.Spec.StorageClassName,
 			VolumeMode:                    srcPV.Spec.VolumeMode,
+			MountOptions:                  srcPV.Spec.MountOptions,
 			PersistentVolumeSource: corev1.PersistentVolumeSource{
 				CSI: &corev1.CSIPersistentVolumeSource{
 					Driver:                     srcPV.Spec.CSI.Driver,
-					VolumeHandle:               rbdImage,
+					VolumeHandle:               volumeHandle,
 					FSType:                     srcPV.Spec.CSI.FSType,
-					VolumeAttributes:           copyAndUpdateAttrs(srcPV.Spec.CSI.VolumeAttributes, rbdImage),
+					VolumeAttributes:           newAttrs,
 					NodeStageSecretRef:         srcPV.Spec.CSI.NodeStageSecretRef,
 					ControllerPublishSecretRef: srcPV.Spec.CSI.ControllerPublishSecretRef,
 					NodePublishSecretRef:       srcPV.Spec.CSI.NodePublishSecretRef,
@@ -294,7 +320,8 @@ func CreatePVCFromRBDImage(
 		},
 	}
 
-	log.Printf("Creating PV %s in destination cluster", pvName)
+	log.Printf("Creating PV %s (volumeHandle=%s, imageName=%s, staticVolume=true)",
+		pvName, volumeHandle, rbdImage)
 	if _, err := client.CoreV1().PersistentVolumes().Create(ctx, newPV, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("failed to create PV: %w", err)
 	}
@@ -317,21 +344,12 @@ func CreatePVCFromRBDImage(
 		},
 	}
 
-	log.Printf("Creating PVC %s/%s in destination cluster", namespace, pvcName)
+	log.Printf("Creating PVC %s/%s bound to PV %s", namespace, pvcName, pvName)
 	if _, err := client.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, newPVC, metav1.CreateOptions{}); err != nil {
 		_ = client.CoreV1().PersistentVolumes().Delete(ctx, pvName, metav1.DeleteOptions{})
 		return fmt.Errorf("failed to create PVC: %w", err)
 	}
 	return nil
-}
-
-func copyAndUpdateAttrs(src map[string]string, newImageName string) map[string]string {
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	dst["imageName"] = newImageName
-	return dst
 }
 
 func ensureNamespace(ctx context.Context, client kubernetes.Interface, namespace string) error {
