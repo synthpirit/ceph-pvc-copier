@@ -374,11 +374,17 @@ func ensureNamespace(ctx context.Context, client kubernetes.Interface, namespace
 // Server
 // ============================================================================
 
+type cachedClient struct {
+	client    kubernetes.Interface
+	createdAt time.Time
+	fromDB    bool
+}
+
 type Server struct {
 	k8sClusters  map[string]*K8sClusterConfig
 	k8sClusterMu sync.RWMutex
 
-	k8sClients map[string]kubernetes.Interface
+	k8sClients map[string]*cachedClient
 	k8sMu      sync.RWMutex
 
 	cephConfig *CephConfig
@@ -392,6 +398,7 @@ type Server struct {
 }
 
 const finishedTaskTTL = 24 * time.Hour
+const dbClientTTL = 10 * time.Minute
 
 func NewServer(port string) *Server {
 	gin.SetMode(gin.ReleaseMode)
@@ -400,7 +407,7 @@ func NewServer(port string) *Server {
 
 	s := &Server{
 		k8sClusters: make(map[string]*K8sClusterConfig),
-		k8sClients:  make(map[string]kubernetes.Interface),
+		k8sClients:  make(map[string]*cachedClient),
 		tasks:       make(map[string]*CopyTask),
 		port:        port,
 		router:      router,
@@ -519,6 +526,11 @@ func (s *Server) handleAddCluster(c *gin.Context) {
 	s.k8sClusterMu.Lock()
 	s.k8sClusters[cfg.Name] = &cfg
 	s.k8sClusterMu.Unlock()
+
+	s.k8sMu.Lock()
+	delete(s.k8sClients, cfg.Name)
+	s.k8sMu.Unlock()
+
 	c.JSON(201, gin.H{"message": "cluster added"})
 }
 
@@ -1041,12 +1053,17 @@ func (s *Server) clusterExists(name string) error {
 func (s *Server) getK8sClient(clusterName string) (kubernetes.Interface, error) {
 	s.k8sMu.RLock()
 	if c, ok := s.k8sClients[clusterName]; ok {
-		s.k8sMu.RUnlock()
-		return c, nil
+		if !c.fromDB || time.Since(c.createdAt) < dbClientTTL {
+			s.k8sMu.RUnlock()
+			return c.client, nil
+		}
 	}
 	s.k8sMu.RUnlock()
 
-	var client kubernetes.Interface
+	var (
+		client kubernetes.Interface
+		fromDB bool
+	)
 
 	s.k8sClusterMu.RLock()
 	cfg, ok := s.k8sClusters[clusterName]
@@ -1068,10 +1085,15 @@ func (s *Server) getK8sClient(clusterName string) (kubernetes.Interface, error) 
 		if err != nil {
 			return nil, err
 		}
+		fromDB = true
 	}
 
 	s.k8sMu.Lock()
-	s.k8sClients[clusterName] = client
+	s.k8sClients[clusterName] = &cachedClient{
+		client:    client,
+		createdAt: time.Now(),
+		fromDB:    fromDB,
+	}
 	s.k8sMu.Unlock()
 	return client, nil
 }
@@ -1113,6 +1135,30 @@ func main() {
 	}
 
 	srv := NewServer(port)
+
+	if monitors := os.Getenv("CEPH_MONITORS"); monitors != "" {
+		cfg := &CephConfig{
+			Monitors: monitors,
+			UserID:   os.Getenv("CEPH_USER_ID"),
+			Key:      os.Getenv("CEPH_KEY"),
+			Pool:     os.Getenv("CEPH_POOL"),
+		}
+		if cfg.UserID == "" {
+			cfg.UserID = "admin"
+		}
+		if cfg.Pool == "" {
+			cfg.Pool = "rbd"
+		}
+		client, err := NewCephClient(cfg)
+		if err != nil {
+			log.Printf("Warning: CEPH_* env vars set but failed to connect: %v", err)
+		} else {
+			client.Close()
+			srv.cephConfig = cfg
+			log.Printf("Ceph configured from environment (monitors=%s, pool=%s, user=%s)", cfg.Monitors, cfg.Pool, cfg.UserID)
+		}
+	}
+
 	if err := srv.Start(); err != nil {
 		log.Fatal(err)
 	}
